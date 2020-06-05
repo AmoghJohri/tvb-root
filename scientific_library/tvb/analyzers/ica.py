@@ -89,7 +89,7 @@ class FastICA(HasTraits):
 
         # ICA operates on matrices, here we perform for all state variables and modes
         W = numpy.zeros((n_comp, n_comp, n_svar, n_mode))  # unmixing
-        K = numpy.zeros((n_comp, n_node, n_svar, n_mode))  # whitening matrix
+        K = numpy.zeros((n_node, n_comp, n_svar, n_mode))  # whitening matrix
         src = numpy.zeros((n_comp, n_time, n_svar, n_mode))  # component time series
 
         for mode in range(n_mode):
