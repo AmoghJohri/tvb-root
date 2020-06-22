@@ -581,22 +581,171 @@ class MixtureOfGammas(HRFKernelEquation):
         return numexpr.evaluate(self.equation, global_dict=self.parameters)
 
 class RestingStateHRF(HRFKernelEquation):
+    """
+    The resting-state Hemodynamic Response Function (rsHRF) corresponding to
+    each region of the subject's connectome, is used to obtain the HRF for
+    BOLD simulation. 
+    There are two ways to account for this:
+    1. The subject's region-wise rsHRF has been obtained beforehand and 
+       provided as an input from a file.
+    2. The subject's region-wise BOLD time-series is provided as input,
+       along with the parameters. The functionality of rsHRF-toolbox 
+       (bids-apps.neuroimaging.io/rsHRF/) is utilized to obtain the
+       required HRF.
+
+    ** References ** :
+
+
+    .. [W_2013] Wu GR, Liao W, Stramaglia S, Ding JR, Chen H, Marinazzo D. 
+                A blind deconvolution approach to recover effective connectivity brain networks from resting state fMRI data.
+                Med Image Anal. 2013;17(3):365-374. doi:10.1016/j.media.2013.01.003
+
+    ** Workflow ** :
+
+
+    .. a. Input From File:
+        a.1 Expected format: Filename for a file containing 2-Dimensional array of float.
+        a.2 Expected dimensions: (time-series length) x (number of regions).
+        a.3 The HRF is transposed, reversed (for the convolution
+            operation in BOLD simulation), and upsampled to (HRF length)/(model's sampling period)
+            where the dimensions of time for HRF length and model's sampling period are same.
+    .. b. Input as Region-Wise BOLD Time-Series:
+        b.1 Expected format: 2-Dimensional numpy array containing the region-wise BOLD time-series.
+        b.2 Expected dimensions: (time-series length) x (number of regions).
+        b.3 The HRF is obtained from the BOLD time-series as described in [W_2013].
+        b.4 This step is same as a.3.
+    .. NOTE: The parameters attribute are only relevant to this branch ('b') of the workflow
+
+    ** Parameters ** :
+
+
+    1. estimation       : Estimation rule for the HRF.
+                                  Two rules are supported:
+                                   1a. canon2dd - canonical HRF with time and dispersion derivates.
+                                   1b. FIR - finite impuse response.
+    2. passband         : Bandpass filtering range.
+    3. TR               : BOLD Repetition Time.
+    4. T                : Magnification factor of temporal grid with respect to TR.
+                                   i.e. para.T=1 for no upsampling, para.T=3 for 3x finer grid.
+                                   Note: T > 1 only for canon2dd estimation parameter.
+    5. T0               : Position of the reference slice in bins, on the grid defined by para.T. 
+                                For example, if the reference slice is the middle one, then para.T0=fix(para.T/2).
+    6. min_onset_search : Minimum delay allowed between event and HRF onset (seconds).
+    7. max_onset_search : Maximum delay allowed between event and HRF onset (seconds).
+    8. AR_lag           : Noise autocorrelation.
+    9. thr              : (mean+) para.thr*standard deviation threshold to detect event.
+    10. len             : length of HRF (seconds).
+
+    ** Default Values ** :
+
+
+    All the default values are based either on [W_2013], or correspond to the default values used in TVB BOLD monitor
+
+    1. estimation       : canon2dd
+    2. passband         : [0.01, 0.08]
+    3. TR               : 0.5 
+    4. T                : 3
+    5. T0               : 1
+    6. min_onset_search : 4
+    7. max_onset_search : 8
+    8. AR_lag           : 1
+    9. thr              : 1
+    10. len             : 24
+    """
+
     
     _ui_name = "HRF Kernel: resting-state HRF"
 
     equation = Final(
         label="Region Wise Resting-State Hemodynamic Response Function",
-        default = "N/A"
+        default = "None"
+    )
+
+    parameters = Attr(
+        field_type=dict,
+        label="Parameters for rsHRF deconvolution from region-wise fMRI time-series",
+        default = lambda:{"estimation":'canon2dd', "passband":[0.01,0.08], "TR":0.5, "T":3, 
+                            "T0":1, "TD_DD":2, "AR_lag":1, "thr":1, "len":24, 
+                            "min_onset_search":4, "max_onset_search":8, "pjobs":1}
+    )
+
+    TR = Attr(
+        field_type=float,
+        label="BOLD Repetition Time",
+        doc="""This is only used if the parameters attribute is not explicitly specified. 
+            It should be the same as BOLD monitor's sampling period"""
+    )
+
+    HRF_length = Attr(
+        field_type=float,
+        label="Length of the Hemodynamic Response Function (in seconds)",
+        doc="""This is only used if the parameters attribute is not explicitly specified.
+             This should be the same as hrf_length attribute of the BOLD monitor"""
+    )
+
+    roiTS = Attr(
+        field_type = numpy.ndarray,
+        label="Region-Wise BOLD Time-Series",
+        default = numpy.array([]),
+        doc="""2-Dimensional numpy array of floats, representing the empirical region-wise fMRI time-series.
+                Only one of roiTS or the rsHRF_filename attribute should be specified """
     )
 
     rsHRF_filename = Attr(
         field_type=str,
-        label="Filename which contains the required rsHRF",
-        default = None
+        label="Filename which contains the required rsHRF",  
+        default = "",
+        doc = """2-Dimensional float values, representing the region-wise HRF
+                Only one of roiTS or the rsHRF_filename attribute should be specified"""
     )
 
     def evaluate(self, var):
-        from scipy import signal                                                               
-        hrf_load=numpy.loadtxt(self.rsHRF_filename)                                          # obtaining input from file
-        upsample=lambda x : signal.resample_poly(x[::-1], var.shape[0], hrf_load.shape[1])   # upsampling the hrf_load signal
-        return  numpy.apply_along_axis(upsample, 1, hrf_load)                                # its shape is (regions x self._stock_steps) 
+        """ 
+        Generate a discrete representation of the equation for the space
+        represented by ``var``.
+        """
+        from scipy import signal, stats
+        if len(self.rsHRF_filename) != 0 and self.roiTS.size != 0:                              # if both rsHRF_filename and roiTS are left unspecified
+            self.log.error("Expected one input (rsHRF file or ROI time-series), got two")       
+        elif len(self.rsHRF_filename) == 0 and self.roiTS.size == 0:                            # if both rsHRF_filename and roiTS are specified
+            self.log.error("Expected one input (rsHRF file or ROI time-series), got zero")        
+        else :
+            if len(self.rsHRF_filename) != 0 :                                              
+                hrf=numpy.loadtxt(self.rsHRF_filename)                                          # obtaining input from file
+            else:                                                              
+                from rsHRF import processing, canon, sFIR                                       # required for obtaining the HRF from the BOLD time-series
+                if not hasattr(self, 'parameters'):                                             # if parameters' default values are used                              
+                    if hasattr(self, 'TR'):   
+                        self.parameters["TR"] = TR                                                         
+                    if hasattr(self, 'HRF_length'):
+                        self.parameters["len"] = HRF_length
+                para = self.parameters
+                pjobs = para["pjobs"]                                                          
+                del para["pjobs"]   
+                para["dt"] = para['TR'] / para['T']                                             # fine-scale time resolution
+                para['lag'] = numpy.arange(numpy.fix(para['min_onset_search'] / para['dt']),    
+                                    numpy.fix(para['max_onset_search'] / para['dt']) + 1,
+                                    dtype='int')
+                bold_sig = self.roiTS                                                           # emperical region-wise BOLD response
+                bold_sig = stats.zscore(bold_sig, ddof=1)                                       # normalizing the BOLD time-series
+                bold_sig = numpy.nan_to_num(bold_sig)                                           # removing nan values
+                bold_sig = processing. \
+                        rest_filter. \
+                        rest_IdealFilter(bold_sig, para['TR'], para['passband'])                # applying the band-pass filter
+                temporal_mask = []                                                              # to mask the relvant time-slices (empty array -> all time-slices are included)
+                if 'canon' in para['estimation']:                                               # estimation through canonical hrf with time and dispersion derivates
+                    beta_hrf, bf, event_bold = \
+                    canon.canon_hrf2dd.wgr_rshrf_estimation_canonhrf2dd_par2(
+                        bold_sig, para, temporal_mask, pjobs
+                    )
+                    hrfa = numpy.dot(bf, beta_hrf[numpy.arange(0, bf.shape[1]), :])
+                elif 'FIR' in para['estimation']:                                               # estimation through finite impulse response
+                    para['T'] = 1
+                    hrfa, event_bold = sFIR. \
+                    smooth_fir. \
+                    wgr_rsHRF_FIR(bold_sig, para, temporal_mask, pjobs)
+                else :
+                    self.log.error("Error: Invalid Estimation Method Selected")
+                hrf = hrfa.T
+        upsample=lambda x : signal.resample_poly(x[::-1], var.shape[0], hrf.shape[1])           # upsampling the obtained hrf signal
+        return  numpy.apply_along_axis(upsample, 1, hrf)                                        # the shape of returned aray is (regions x self._stock_steps) 
